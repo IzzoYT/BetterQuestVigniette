@@ -1,0 +1,2379 @@
+using System;
+using BoneLib;
+using BoneLib.BoneMenu;
+using HarmonyLib;
+using Il2CppSLZ.Bonelab;
+using Il2CppSLZ.Marrow;
+using MelonLoader;
+using UnityEngine;
+
+[assembly: MelonInfo(
+    typeof(QuestDeathVignette.QuestDeathVignetteMod),
+    "Quest Death Vignette Replacer",
+    "1.4.0",
+    "NovaVR"
+)]
+
+[assembly: MelonGame("Stress Level Zero", "BONELAB")]
+
+namespace QuestDeathVignette
+{
+    public enum VignetteMode
+    {
+        PCVR,
+        Soft,
+        Heavy,
+        Minimal,
+        Off
+    }
+
+    public class QuestDeathVignetteMod : MelonMod
+    {
+        // =========================================================
+        // MOD INSTANCE / LOGGER
+        // =========================================================
+
+        private static QuestDeathVignetteMod Instance;
+
+        private static void Log(string message)
+        {
+            if (Instance != null)
+                Instance.LoggerInstance.Msg(message);
+        }
+
+        private static void Warn(string message)
+        {
+            if (Instance != null)
+                Instance.LoggerInstance.Warning(message);
+        }
+
+        private static void Error(string message)
+        {
+            if (Instance != null)
+                Instance.LoggerInstance.Error(message);
+        }
+
+        // =========================================================
+        // MAIN SETTINGS
+        // =========================================================
+
+        public static bool Enabled = true;
+        public static bool ReplaceVanilla = true;
+
+        public static bool DamageVignette = true;
+        public static bool DeathVignette = true;
+
+        public static bool HeartbeatEnabled = true;
+        public static bool IrregularEdges = true;
+        public static bool PeripheralDarkening = true;
+
+        public static VignetteMode Mode =
+            VignetteMode.Soft;
+
+        // =========================================================
+        // APPEARANCE
+        // =========================================================
+
+        public static float VignetteIntensity = 0.66f;
+
+        // Darker red by default
+        public static float RedAmount = 0.62f;
+        public static float Darkness = 0.90f;
+
+        public static float Softness = 0.28f;
+
+        public static float StartingRadius = 0.80f;
+        public static float DeathRadius = 0.035f;
+
+        public static float EdgeDistortion = 0.035f;
+        public static float EdgeNoiseScale = 6f;
+
+        // =========================================================
+        // DAMAGE SETTINGS
+        // =========================================================
+
+        public static float DamagePulseIntensity = 0.72f;
+
+        public static float DamageFadeSpeed = 1.75f;
+
+        // How far inward the vignette pushes when hit.
+        public static float DamageCrowdStrength = 0.24f;
+
+        // Minimum visible damage effect.
+        public static float MinimumDamageEffect = 0.38f;
+
+        // Keep it visible briefly before retreating.
+        public static float DamageHoldTime = 0.14f;
+
+        // How fast the vignette crowds inward.
+        public static float DamageCrowdInSpeed = 14f;
+
+        // How fast it goes back outward.
+        public static float DamageCrowdOutSpeed = 5f;
+
+        // =========================================================
+        // DEATH SETTINGS
+        // =========================================================
+
+        public static float DeathCloseSpeed = 0.60f;
+        public static float DeathFadeSpeed = 0.70f;
+
+        // =========================================================
+        // HEARTBEAT VISUAL
+        // =========================================================
+
+        public static float HeartbeatStrength = 0.12f;
+        public static float HeartbeatSpeed = 1.05f;
+
+        // =========================================================
+        // RUNTIME
+        // =========================================================
+
+        private static GameObject vignetteObject;
+
+        private static MeshRenderer vignetteRenderer;
+        private static Material vignetteMaterial;
+        private static Texture2D vignetteTexture;
+
+        private static Camera headsetCamera;
+
+        private static float currentAlpha;
+        private static float targetAlpha;
+
+        private static float pulseAlpha;
+
+        private static float deathProgress;
+        private static float heartbeatTimer;
+
+        // Damage animation
+        private static float damageTimer;
+        private static float damageStrength;
+
+        private static float currentDamageRadius;
+        private static float targetDamageRadius;
+
+        private static bool dying;
+        private static bool dead;
+
+        private static float currentRadius = -1f;
+        private static float lastTextureUpdateTime;
+
+        private static float lastAudioSafetyReset;
+
+        // Quest optimized
+        private const int TextureSize = 128;
+
+        private const float TextureUpdateInterval = 0.035f;
+        private const float AudioResetInterval = 0.50f;
+
+        // =========================================================
+        // INITIALIZE
+        // =========================================================
+
+        public override void OnInitializeMelon()
+        {
+            Instance = this;
+
+            Log("========================================");
+            Log(" Quest Death Vignette Replacer v1.4");
+            Log(" Damage crowding + darker Soft preset");
+            Log("========================================");
+
+            SetupMenu();
+
+            Hooking.OnPlayerDamageReceived +=
+                OnPlayerDamage;
+
+            Hooking.OnPlayerDeathImminent +=
+                OnDeathImminent;
+
+            Hooking.OnPlayerDeath +=
+                OnDeath;
+
+            Hooking.OnPlayerResurrected +=
+                OnResurrected;
+
+            Hooking.OnLevelLoaded += level =>
+            {
+                RestoreNormalAudio();
+
+                DestroyVignette();
+
+                ResetRuntimeState();
+
+                CreateVignette();
+
+                Log(
+                    "Level loaded - vignette recreated."
+                );
+            };
+
+            Hooking.OnLevelUnloaded += () =>
+            {
+                RestoreNormalAudio();
+
+                DestroyVignette();
+
+                ResetRuntimeState();
+
+                Log(
+                    "Level unloaded - effect cleaned."
+                );
+            };
+
+            try
+            {
+                HarmonyInstance.PatchAll();
+
+                Log(
+                    "Quest spike suppression loaded."
+                );
+            }
+            catch (Exception ex)
+            {
+                Warn(
+                    "Harmony patch failed: " +
+                    ex.Message
+                );
+            }
+        }
+
+        // =========================================================
+        // BONEMENU
+        // =========================================================
+
+        private static void SetupMenu()
+        {
+            Page menu =
+                Page.Root.CreatePage(
+                    "Death Vignette",
+                    new Color(
+                        0.45f,
+                        0.02f,
+                        0.02f
+                    )
+                );
+
+            menu.CreateBool(
+                "Enabled",
+                Color.white,
+                Enabled,
+                value =>
+                {
+                    Enabled = value;
+
+                    if (!Enabled)
+                        ResetEffect();
+                }
+            );
+
+            menu.CreateBool(
+                "Replace Quest Spikes",
+                Color.white,
+                ReplaceVanilla,
+                value =>
+                {
+                    ReplaceVanilla = value;
+                }
+            );
+
+            menu.CreateEnum(
+                "Style",
+                Color.white,
+                Mode,
+                value =>
+                {
+                    Mode =
+                        (VignetteMode)value;
+
+                    ApplyPreset();
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            menu.CreateBool(
+                "Damage Vignette",
+                Color.white,
+                DamageVignette,
+                value =>
+                {
+                    DamageVignette = value;
+
+                    if (!DamageVignette)
+                    {
+                        pulseAlpha = 0f;
+                        damageTimer = 0f;
+                    }
+                }
+            );
+
+            menu.CreateBool(
+                "Death Vignette",
+                Color.white,
+                DeathVignette,
+                value =>
+                {
+                    DeathVignette = value;
+                }
+            );
+
+            // =====================================================
+            // APPEARANCE
+            // =====================================================
+
+            Page appearance =
+                menu.CreatePage(
+                    "Appearance",
+                    new Color(
+                        0.38f,
+                        0.02f,
+                        0.02f
+                    )
+                );
+
+            appearance.CreateFloat(
+                "Intensity",
+                Color.white,
+                VignetteIntensity,
+                0.05f,
+                0f,
+                1f,
+                value =>
+                {
+                    VignetteIntensity = value;
+                }
+            );
+
+            appearance.CreateFloat(
+                "Red Amount",
+                Color.white,
+                RedAmount,
+                0.05f,
+                0f,
+                1f,
+                value =>
+                {
+                    RedAmount = value;
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            appearance.CreateFloat(
+                "Darkness",
+                Color.white,
+                Darkness,
+                0.05f,
+                0f,
+                1f,
+                value =>
+                {
+                    Darkness = value;
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            appearance.CreateFloat(
+                "Edge Softness",
+                Color.white,
+                Softness,
+                0.025f,
+                0.025f,
+                0.60f,
+                value =>
+                {
+                    Softness = value;
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            appearance.CreateBool(
+                "Irregular Edges",
+                Color.white,
+                IrregularEdges,
+                value =>
+                {
+                    IrregularEdges = value;
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            appearance.CreateFloat(
+                "Edge Distortion",
+                Color.white,
+                EdgeDistortion,
+                0.005f,
+                0f,
+                0.15f,
+                value =>
+                {
+                    EdgeDistortion = value;
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            appearance.CreateBool(
+                "Peripheral Darkness",
+                Color.white,
+                PeripheralDarkening,
+                value =>
+                {
+                    PeripheralDarkening = value;
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            // =====================================================
+            // DAMAGE
+            // =====================================================
+
+            Page damage =
+                menu.CreatePage(
+                    "Damage Effect",
+                    new Color(
+                        0.52f,
+                        0.03f,
+                        0.03f
+                    )
+                );
+
+            damage.CreateFloat(
+                "Damage Intensity",
+                Color.white,
+                DamagePulseIntensity,
+                0.05f,
+                0.10f,
+                1f,
+                value =>
+                {
+                    DamagePulseIntensity = value;
+                }
+            );
+
+            damage.CreateFloat(
+                "Crowd In Amount",
+                Color.white,
+                DamageCrowdStrength,
+                0.02f,
+                0.02f,
+                0.55f,
+                value =>
+                {
+                    DamageCrowdStrength = value;
+                }
+            );
+
+            damage.CreateFloat(
+                "Minimum Visibility",
+                Color.white,
+                MinimumDamageEffect,
+                0.05f,
+                0.10f,
+                1f,
+                value =>
+                {
+                    MinimumDamageEffect = value;
+                }
+            );
+
+            damage.CreateFloat(
+                "Hold Time",
+                Color.white,
+                DamageHoldTime,
+                0.02f,
+                0f,
+                0.60f,
+                value =>
+                {
+                    DamageHoldTime = value;
+                }
+            );
+
+            damage.CreateFloat(
+                "Crowd In Speed",
+                Color.white,
+                DamageCrowdInSpeed,
+                1f,
+                1f,
+                30f,
+                value =>
+                {
+                    DamageCrowdInSpeed = value;
+                }
+            );
+
+            damage.CreateFloat(
+                "Retreat Speed",
+                Color.white,
+                DamageCrowdOutSpeed,
+                0.5f,
+                0.5f,
+                15f,
+                value =>
+                {
+                    DamageCrowdOutSpeed = value;
+                }
+            );
+
+            damage.CreateFloat(
+                "Fade Speed",
+                Color.white,
+                DamageFadeSpeed,
+                0.25f,
+                0.25f,
+                10f,
+                value =>
+                {
+                    DamageFadeSpeed = value;
+                }
+            );
+
+            // =====================================================
+            // DEATH
+            // =====================================================
+
+            Page death =
+                menu.CreatePage(
+                    "Death Effect",
+                    new Color(
+                        0.32f,
+                        0f,
+                        0f
+                    )
+                );
+
+            death.CreateFloat(
+                "Closing Speed",
+                Color.white,
+                DeathCloseSpeed,
+                0.05f,
+                0.10f,
+                3f,
+                value =>
+                {
+                    DeathCloseSpeed = value;
+                }
+            );
+
+            death.CreateFloat(
+                "Start Radius",
+                Color.white,
+                StartingRadius,
+                0.025f,
+                0.30f,
+                0.95f,
+                value =>
+                {
+                    StartingRadius = value;
+
+                    ForceTextureRefresh();
+                }
+            );
+
+            death.CreateFloat(
+                "Final Radius",
+                Color.white,
+                DeathRadius,
+                0.01f,
+                0f,
+                0.40f,
+                value =>
+                {
+                    DeathRadius = value;
+                }
+            );
+
+            death.CreateFloat(
+                "Final Fade",
+                Color.white,
+                DeathFadeSpeed,
+                0.05f,
+                0.05f,
+                3f,
+                value =>
+                {
+                    DeathFadeSpeed = value;
+                }
+            );
+
+            // =====================================================
+            // HEARTBEAT
+            // =====================================================
+
+            Page heartbeat =
+                menu.CreatePage(
+                    "Heartbeat",
+                    new Color(
+                        0.38f,
+                        0.01f,
+                        0.01f
+                    )
+                );
+
+            heartbeat.CreateBool(
+                "Visual Heartbeat",
+                Color.white,
+                HeartbeatEnabled,
+                value =>
+                {
+                    HeartbeatEnabled = value;
+                }
+            );
+
+            heartbeat.CreateFloat(
+                "Strength",
+                Color.white,
+                HeartbeatStrength,
+                0.025f,
+                0f,
+                0.40f,
+                value =>
+                {
+                    HeartbeatStrength = value;
+                }
+            );
+
+            heartbeat.CreateFloat(
+                "Speed",
+                Color.white,
+                HeartbeatSpeed,
+                0.05f,
+                0.40f,
+                3f,
+                value =>
+                {
+                    HeartbeatSpeed = value;
+                }
+            );
+
+            // =====================================================
+            // TESTING
+            // =====================================================
+
+            Page testing =
+                menu.CreatePage(
+                    "Testing",
+                    Color.gray
+                );
+
+            testing.CreateFunction(
+                "Test Small Hit",
+                Color.white,
+                () =>
+                {
+                    TestDamage(
+                        0.45f
+                    );
+                }
+            );
+
+            testing.CreateFunction(
+                "Test Heavy Hit",
+                new Color(
+                    0.55f,
+                    0.05f,
+                    0.05f
+                ),
+                () =>
+                {
+                    TestDamage(
+                        1f
+                    );
+                }
+            );
+
+            testing.CreateFunction(
+                "Test Death",
+                new Color(
+                    0.4f,
+                    0f,
+                    0f
+                ),
+                TestDeath
+            );
+
+            testing.CreateFunction(
+                "Restore Audio",
+                Color.white,
+                RestoreNormalAudio
+            );
+
+            testing.CreateFunction(
+                "Recreate Vignette",
+                Color.white,
+                RecreateVignette
+            );
+
+            testing.CreateFunction(
+                "Reset Effect",
+                Color.gray,
+                ResetEffect
+            );
+        }
+
+        // =========================================================
+        // PRESETS
+        // =========================================================
+
+        private static void ApplyPreset()
+        {
+            switch (Mode)
+            {
+                // -------------------------------------------------
+                // PCVR
+                // -------------------------------------------------
+
+                case VignetteMode.PCVR:
+
+                    VignetteIntensity =
+                        0.82f;
+
+                    RedAmount =
+                        0.78f;
+
+                    Darkness =
+                        0.82f;
+
+                    Softness =
+                        0.20f;
+
+                    StartingRadius =
+                        0.72f;
+
+                    DeathRadius =
+                        0.025f;
+
+                    EdgeDistortion =
+                        0.050f;
+
+                    DamagePulseIntensity =
+                        0.82f;
+
+                    DamageCrowdStrength =
+                        0.28f;
+
+                    MinimumDamageEffect =
+                        0.45f;
+
+                    DamageHoldTime =
+                        0.12f;
+
+                    HeartbeatStrength =
+                        0.14f;
+
+                    break;
+
+                // -------------------------------------------------
+                // SOFT
+                //
+                // Much darker red, wider and softer edge like
+                // the screenshot you provided.
+                // -------------------------------------------------
+
+                case VignetteMode.Soft:
+
+                    VignetteIntensity =
+                        0.66f;
+
+                    RedAmount =
+                        0.60f;
+
+                    Darkness =
+                        0.92f;
+
+                    Softness =
+                        0.30f;
+
+                    StartingRadius =
+                        0.81f;
+
+                    DeathRadius =
+                        0.055f;
+
+                    EdgeDistortion =
+                        0.025f;
+
+                    DamagePulseIntensity =
+                        0.68f;
+
+                    DamageCrowdStrength =
+                        0.22f;
+
+                    MinimumDamageEffect =
+                        0.40f;
+
+                    DamageHoldTime =
+                        0.16f;
+
+                    HeartbeatStrength =
+                        0.10f;
+
+                    break;
+
+                // -------------------------------------------------
+                // HEAVY
+                // -------------------------------------------------
+
+                case VignetteMode.Heavy:
+
+                    VignetteIntensity =
+                        1f;
+
+                    RedAmount =
+                        0.90f;
+
+                    Darkness =
+                        0.98f;
+
+                    Softness =
+                        0.13f;
+
+                    StartingRadius =
+                        0.65f;
+
+                    DeathRadius =
+                        0f;
+
+                    EdgeDistortion =
+                        0.075f;
+
+                    DamagePulseIntensity =
+                        1f;
+
+                    DamageCrowdStrength =
+                        0.40f;
+
+                    MinimumDamageEffect =
+                        0.65f;
+
+                    DamageHoldTime =
+                        0.20f;
+
+                    HeartbeatStrength =
+                        0.20f;
+
+                    break;
+
+                // -------------------------------------------------
+                // MINIMAL
+                // -------------------------------------------------
+
+                case VignetteMode.Minimal:
+
+                    VignetteIntensity =
+                        0.38f;
+
+                    RedAmount =
+                        0.45f;
+
+                    Darkness =
+                        0.70f;
+
+                    Softness =
+                        0.38f;
+
+                    StartingRadius =
+                        0.86f;
+
+                    DeathRadius =
+                        0.22f;
+
+                    EdgeDistortion =
+                        0.015f;
+
+                    DamagePulseIntensity =
+                        0.42f;
+
+                    DamageCrowdStrength =
+                        0.12f;
+
+                    MinimumDamageEffect =
+                        0.25f;
+
+                    DamageHoldTime =
+                        0.08f;
+
+                    HeartbeatStrength =
+                        0.05f;
+
+                    break;
+
+                case VignetteMode.Off:
+
+                    ResetEffect();
+
+                    break;
+            }
+        }
+
+        // =========================================================
+        // PLAYER DAMAGE
+        // =========================================================
+
+        private static void OnPlayerDamage(
+            RigManager rigManager,
+            float damage
+        )
+        {
+            if (!Enabled)
+                return;
+
+            if (!DamageVignette)
+                return;
+
+            if (Mode ==
+                VignetteMode.Off)
+                return;
+
+            EnsureVignette();
+
+            // Convert BONELAB damage into a useful 0-1 strength.
+            //
+            // Even tiny hits will now produce a visible vignette.
+            float normalizedDamage =
+                Mathf.Clamp01(
+                    damage / 20f
+                );
+
+            normalizedDamage =
+                Mathf.Max(
+                    normalizedDamage,
+                    0.18f
+                );
+
+            TriggerDamageEffect(
+                normalizedDamage
+            );
+
+            Log(
+                "Damage received: " +
+                damage.ToString("0.00") +
+                " | vignette strength: " +
+                normalizedDamage.ToString("0.00")
+            );
+        }
+
+        // =========================================================
+        // TRIGGER DAMAGE EFFECT
+        // =========================================================
+
+        private static void TriggerDamageEffect(
+            float strength
+        )
+        {
+            strength =
+                Mathf.Clamp01(
+                    strength
+                );
+
+            damageStrength =
+                Mathf.Max(
+                    damageStrength,
+                    strength
+                );
+
+            damageTimer =
+                DamageHoldTime;
+
+            // Make sure the hit is actually visible.
+            float hitAlpha =
+                Mathf.Lerp(
+                    MinimumDamageEffect,
+                    DamagePulseIntensity,
+                    strength
+                );
+
+            pulseAlpha =
+                Mathf.Max(
+                    pulseAlpha,
+                    hitAlpha
+                );
+
+            targetAlpha =
+                Mathf.Max(
+                    targetAlpha,
+                    hitAlpha
+                );
+
+            // Crowd inward.
+            targetDamageRadius =
+                StartingRadius -
+                (
+                    DamageCrowdStrength *
+                    Mathf.Lerp(
+                        0.45f,
+                        1f,
+                        strength
+                    )
+                );
+
+            targetDamageRadius =
+                Mathf.Clamp(
+                    targetDamageRadius,
+                    0.18f,
+                    StartingRadius
+                );
+
+            // Immediately make the renderer visible.
+            if (vignetteRenderer != null)
+            {
+                vignetteRenderer.enabled =
+                    true;
+            }
+        }
+
+        // =========================================================
+        // DEATH IMMINENT
+        // =========================================================
+
+        private static void OnDeathImminent(
+            RigManager rigManager
+        )
+        {
+            if (!Enabled)
+                return;
+
+            if (!DeathVignette)
+                return;
+
+            if (Mode ==
+                VignetteMode.Off)
+                return;
+
+            EnsureVignette();
+
+            dying = true;
+            dead = false;
+
+            deathProgress = 0f;
+            heartbeatTimer = 0f;
+
+            targetAlpha =
+                Mathf.Max(
+                    currentAlpha,
+                    VignetteIntensity
+                );
+
+            Log(
+                "Death imminent - death vignette started."
+            );
+        }
+
+        // =========================================================
+        // DEATH
+        // =========================================================
+
+        private static void OnDeath(
+            RigManager rigManager
+        )
+        {
+            if (!Enabled)
+                return;
+
+            if (!DeathVignette)
+                return;
+
+            EnsureVignette();
+
+            dying = true;
+            dead = true;
+
+            targetAlpha = 1f;
+
+            Log(
+                "Player death detected."
+            );
+        }
+
+        // =========================================================
+        // RESURRECT
+        // =========================================================
+
+        private static void OnResurrected(
+            RigManager rigManager
+        )
+        {
+            ResetRuntimeState();
+
+            RestoreNormalAudio();
+
+            ForceTextureRefresh();
+
+            HideVignette();
+
+            Log(
+                "Player resurrected - vignette reset."
+            );
+        }
+
+        // =========================================================
+        // UPDATE
+        // =========================================================
+
+        public override void OnUpdate()
+        {
+            if (!Enabled ||
+                Mode == VignetteMode.Off)
+            {
+                HideVignette();
+
+                AudioSafetyCheck();
+
+                return;
+            }
+
+            EnsureVignette();
+
+            if (vignetteRenderer == null)
+                return;
+
+            UpdateTransform();
+
+            if (dying)
+            {
+                UpdateDeath();
+            }
+            else
+            {
+                UpdateDamage();
+            }
+
+            UpdateMaterial();
+
+            // Don't leave renderer running when fully invisible.
+            if (!dying &&
+                currentAlpha <= 0.001f &&
+                pulseAlpha <= 0.001f)
+            {
+                vignetteRenderer.enabled =
+                    false;
+            }
+            else
+            {
+                vignetteRenderer.enabled =
+                    true;
+            }
+
+            AudioSafetyCheck();
+        }
+
+        // =========================================================
+        // DAMAGE ANIMATION
+        // =========================================================
+
+        private static void UpdateDamage()
+        {
+            // -----------------------------------------------------
+            // DAMAGE HOLD
+            // -----------------------------------------------------
+
+            if (damageTimer > 0f)
+            {
+                damageTimer -=
+                    Time.unscaledDeltaTime;
+
+                currentDamageRadius =
+                    Mathf.Lerp(
+                        currentDamageRadius,
+                        targetDamageRadius,
+                        Mathf.Clamp01(
+                            Time.unscaledDeltaTime *
+                            DamageCrowdInSpeed
+                        )
+                    );
+            }
+            else
+            {
+                // Return the vignette to the outside edge.
+                targetDamageRadius =
+                    StartingRadius;
+
+                currentDamageRadius =
+                    Mathf.Lerp(
+                        currentDamageRadius,
+                        StartingRadius,
+                        Mathf.Clamp01(
+                            Time.unscaledDeltaTime *
+                            DamageCrowdOutSpeed
+                        )
+                    );
+
+                pulseAlpha =
+                    Mathf.MoveTowards(
+                        pulseAlpha,
+                        0f,
+                        Time.unscaledDeltaTime *
+                        DamageFadeSpeed
+                    );
+
+                damageStrength =
+                    Mathf.MoveTowards(
+                        damageStrength,
+                        0f,
+                        Time.unscaledDeltaTime *
+                        DamageFadeSpeed
+                    );
+            }
+
+            // -----------------------------------------------------
+            // ALPHA
+            // -----------------------------------------------------
+
+            targetAlpha =
+                pulseAlpha;
+
+            float alphaSpeed =
+                damageTimer > 0f
+                    ? 14f
+                    : 5f;
+
+            currentAlpha =
+                Mathf.Lerp(
+                    currentAlpha,
+                    targetAlpha,
+                    Mathf.Clamp01(
+                        Time.unscaledDeltaTime *
+                        alphaSpeed
+                    )
+                );
+
+            if (pulseAlpha <= 0.001f)
+            {
+                currentAlpha =
+                    Mathf.MoveTowards(
+                        currentAlpha,
+                        0f,
+                        Time.unscaledDeltaTime *
+                        DamageFadeSpeed
+                    );
+            }
+
+            // -----------------------------------------------------
+            // CROWD THE TEXTURE INWARD
+            // -----------------------------------------------------
+
+            UpdateRadius(
+                currentDamageRadius
+            );
+        }
+
+        // =========================================================
+        // DEATH UPDATE
+        // =========================================================
+
+        private static void UpdateDeath()
+        {
+            heartbeatTimer +=
+                Time.unscaledDeltaTime *
+                HeartbeatSpeed;
+
+            deathProgress +=
+                Time.unscaledDeltaTime *
+                DeathCloseSpeed;
+
+            deathProgress =
+                Mathf.Clamp01(
+                    deathProgress
+                );
+
+            float eased =
+                SmootherStep(
+                    deathProgress
+                );
+
+            float radius =
+                Mathf.Lerp(
+                    StartingRadius,
+                    DeathRadius,
+                    eased
+                );
+
+            float heartbeat = 0f;
+
+            if (HeartbeatEnabled &&
+                !dead)
+            {
+                heartbeat =
+                    GetHeartbeatPulse();
+
+                radius -=
+                    heartbeat *
+                    0.022f;
+            }
+
+            radius =
+                Mathf.Max(
+                    DeathRadius,
+                    radius
+                );
+
+            UpdateRadius(radius);
+
+            float desiredAlpha =
+                Mathf.Lerp(
+                    VignetteIntensity,
+                    1f,
+                    eased
+                );
+
+            if (HeartbeatEnabled &&
+                !dead)
+            {
+                desiredAlpha +=
+                    heartbeat *
+                    HeartbeatStrength;
+            }
+
+            desiredAlpha =
+                Mathf.Clamp01(
+                    desiredAlpha
+                );
+
+            currentAlpha =
+                Mathf.Lerp(
+                    currentAlpha,
+                    desiredAlpha,
+                    Mathf.Clamp01(
+                        Time.unscaledDeltaTime *
+                        9f
+                    )
+                );
+
+            if (dead &&
+                deathProgress >= 1f)
+            {
+                currentAlpha =
+                    Mathf.MoveTowards(
+                        currentAlpha,
+                        1f,
+                        Time.unscaledDeltaTime *
+                        DeathFadeSpeed
+                    );
+            }
+        }
+
+        // =========================================================
+        // HEARTBEAT
+        // =========================================================
+
+        private static float GetHeartbeatPulse()
+        {
+            float cycle =
+                heartbeatTimer % 1f;
+
+            float first =
+                GaussianPulse(
+                    cycle,
+                    0.10f,
+                    0.055f
+                );
+
+            float second =
+                GaussianPulse(
+                    cycle,
+                    0.28f,
+                    0.045f
+                );
+
+            second *= 0.65f;
+
+            return Mathf.Clamp01(
+                first +
+                second
+            );
+        }
+
+        private static float GaussianPulse(
+            float x,
+            float center,
+            float width
+        )
+        {
+            float difference =
+                x - center;
+
+            return Mathf.Exp(
+                -(difference *
+                  difference) /
+                (
+                    2f *
+                    width *
+                    width
+                )
+            );
+        }
+
+        // =========================================================
+        // CREATE VIGNETTE
+        // =========================================================
+
+        private static void EnsureVignette()
+        {
+            if (vignetteObject == null)
+            {
+                CreateVignette();
+            }
+        }
+
+        private static void CreateVignette()
+        {
+            if (Player.Head == null)
+                return;
+
+            DestroyVignette();
+
+            try
+            {
+                headsetCamera =
+                    Player.Head
+                        .GetComponentInChildren<Camera>(
+                            true
+                        );
+            }
+            catch
+            {
+                headsetCamera = null;
+            }
+
+            vignetteObject =
+                GameObject.CreatePrimitive(
+                    PrimitiveType.Quad
+                );
+
+            vignetteObject.name =
+                "QuestDeathVignette_PCStyle";
+
+            Collider collider =
+                vignetteObject
+                    .GetComponent<Collider>();
+
+            if (collider != null)
+            {
+                UnityEngine.Object.Destroy(
+                    collider
+                );
+            }
+
+            vignetteObject.transform.SetParent(
+                Player.Head,
+                false
+            );
+
+            vignetteObject.transform.localPosition =
+                new Vector3(
+                    0f,
+                    0f,
+                    0.25f
+                );
+
+            vignetteObject.transform.localRotation =
+                Quaternion.Euler(
+                    0f,
+                    180f,
+                    0f
+                );
+
+            vignetteObject.transform.localScale =
+                new Vector3(
+                    1.15f,
+                    1.05f,
+                    1f
+                );
+
+            if (headsetCamera != null)
+            {
+                vignetteObject.layer =
+                    headsetCamera.gameObject.layer;
+            }
+
+            vignetteRenderer =
+                vignetteObject
+                    .GetComponent<MeshRenderer>();
+
+            Shader shader =
+                Shader.Find(
+                    "Sprites/Default"
+                );
+
+            if (shader == null)
+            {
+                shader =
+                    Shader.Find(
+                        "Unlit/Transparent"
+                    );
+            }
+
+            if (shader == null)
+            {
+                Error(
+                    "No transparent shader found."
+                );
+
+                DestroyVignette();
+
+                return;
+            }
+
+            vignetteMaterial =
+                new Material(
+                    shader
+                );
+
+            vignetteMaterial.name =
+                "QuestDeathVignetteMaterial";
+
+            vignetteMaterial.renderQueue =
+                5000;
+
+            vignetteRenderer.material =
+                vignetteMaterial;
+
+            vignetteTexture =
+                new Texture2D(
+                    TextureSize,
+                    TextureSize,
+                    TextureFormat.RGBA32,
+                    false
+                );
+
+            vignetteTexture.wrapMode =
+                TextureWrapMode.Clamp;
+
+            vignetteTexture.filterMode =
+                FilterMode.Bilinear;
+
+            currentRadius = -1f;
+
+            currentDamageRadius =
+                StartingRadius;
+
+            targetDamageRadius =
+                StartingRadius;
+
+            BuildTexture(
+                StartingRadius
+            );
+
+            HideVignette();
+
+            Log(
+                "Quest vignette renderer created."
+            );
+        }
+
+        // =========================================================
+        // HEAD FOLLOW
+        // =========================================================
+
+        private static void UpdateTransform()
+        {
+            if (Player.Head == null ||
+                vignetteObject == null)
+            {
+                return;
+            }
+
+            if (vignetteObject.transform.parent !=
+                Player.Head)
+            {
+                vignetteObject.transform.SetParent(
+                    Player.Head,
+                    false
+                );
+            }
+
+            vignetteObject.transform.localPosition =
+                new Vector3(
+                    0f,
+                    0f,
+                    0.25f
+                );
+
+            vignetteObject.transform.localRotation =
+                Quaternion.Euler(
+                    0f,
+                    180f,
+                    0f
+                );
+
+            vignetteObject.transform.localScale =
+                new Vector3(
+                    1.15f,
+                    1.05f,
+                    1f
+                );
+
+            if (headsetCamera == null)
+            {
+                try
+                {
+                    headsetCamera =
+                        Player.Head
+                            .GetComponentInChildren<Camera>(
+                                true
+                            );
+                }
+                catch
+                {
+                    headsetCamera = null;
+                }
+            }
+
+            if (headsetCamera != null)
+            {
+                vignetteObject.layer =
+                    headsetCamera.gameObject.layer;
+            }
+        }
+
+        // =========================================================
+        // RADIUS
+        // =========================================================
+
+        private static void UpdateRadius(
+            float radius
+        )
+        {
+            // Smaller threshold so damage movement looks smoother.
+            if (Mathf.Abs(
+                    radius -
+                    currentRadius
+                ) < 0.006f)
+            {
+                return;
+            }
+
+            if (Time.unscaledTime -
+                lastTextureUpdateTime <
+                TextureUpdateInterval)
+            {
+                return;
+            }
+
+            lastTextureUpdateTime =
+                Time.unscaledTime;
+
+            BuildTexture(radius);
+        }
+
+        // =========================================================
+        // TEXTURE
+        // =========================================================
+
+        private static void BuildTexture(
+            float radius
+        )
+        {
+            if (vignetteTexture == null)
+                return;
+
+            currentRadius = radius;
+
+            Color32[] pixels =
+                new Color32[
+                    TextureSize *
+                    TextureSize
+                ];
+
+            float center =
+                (TextureSize - 1) *
+                0.5f;
+
+            for (int y = 0;
+                 y < TextureSize;
+                 y++)
+            {
+                for (int x = 0;
+                     x < TextureSize;
+                     x++)
+                {
+                    float nx =
+                        (x - center) /
+                        center;
+
+                    float ny =
+                        (y - center) /
+                        center;
+
+                    // Oval FOV.
+                    nx *= 0.92f;
+
+                    float distance =
+                        Mathf.Sqrt(
+                            nx * nx +
+                            ny * ny
+                        );
+
+                    float angle =
+                        Mathf.Atan2(
+                            ny,
+                            nx
+                        );
+
+                    float distortedRadius =
+                        radius;
+
+                    if (IrregularEdges)
+                    {
+                        distortedRadius +=
+                            EdgeNoise(angle) *
+                            EdgeDistortion;
+                    }
+
+                    float alpha =
+                        Mathf.InverseLerp(
+                            distortedRadius,
+                            distortedRadius +
+                            Softness,
+                            distance
+                        );
+
+                    alpha =
+                        Mathf.Clamp01(
+                            alpha
+                        );
+
+                    alpha =
+                        SmoothStep(
+                            alpha
+                        );
+
+                    float peripheral =
+                        Mathf.Clamp01(
+                            (
+                                distance -
+                                0.58f
+                            ) /
+                            0.50f
+                        );
+
+                    if (!PeripheralDarkening)
+                    {
+                        peripheral = 0f;
+                    }
+
+                    // =================================================
+                    // DARK RED COLORING
+                    // =================================================
+
+                    float r;
+                    float g;
+                    float b;
+
+                    if (Mode ==
+                        VignetteMode.Soft)
+                    {
+                        // Reference-style darker red:
+                        //
+                        // almost black at the far edge,
+                        // muted dark burgundy closer inward.
+                        float dark =
+                            Mathf.Lerp(
+                                0.07f,
+                                0.015f,
+                                peripheral
+                            );
+
+                        r =
+                            Mathf.Lerp(
+                                0.20f,
+                                0.09f,
+                                peripheral
+                            );
+
+                        g =
+                            dark *
+                            0.50f;
+
+                        b =
+                            dark *
+                            0.45f;
+
+                        // Slight red glow around inner edge.
+                        float innerBand =
+                            Mathf.Clamp01(
+                                1f -
+                                Mathf.Abs(
+                                    distance -
+                                    distortedRadius
+                                ) /
+                                0.18f
+                            );
+
+                        r +=
+                            innerBand *
+                            0.055f;
+                    }
+                    else
+                    {
+                        float darkness =
+                            Mathf.Lerp(
+                                0.17f,
+                                Darkness,
+                                alpha
+                            );
+
+                        darkness =
+                            Mathf.Clamp01(
+                                darkness
+                            );
+
+                        r =
+                            Mathf.Lerp(
+                                darkness,
+                                1f,
+                                RedAmount *
+                                0.72f
+                            );
+
+                        g =
+                            darkness *
+                            (
+                                1f -
+                                RedAmount *
+                                0.92f
+                            );
+
+                        b =
+                            darkness *
+                            (
+                                1f -
+                                RedAmount
+                            );
+                    }
+
+                    // Darken the extreme edge.
+                    if (PeripheralDarkening)
+                    {
+                        float extremeDark =
+                            Mathf.Lerp(
+                                1f,
+                                0.32f,
+                                peripheral
+                            );
+
+                        r *= extremeDark;
+                        g *= extremeDark;
+                        b *= extremeDark;
+                    }
+
+                    pixels[
+                        y *
+                        TextureSize +
+                        x
+                    ] =
+                        new Color32(
+                            FloatToByte(r),
+                            FloatToByte(g),
+                            FloatToByte(b),
+                            FloatToByte(alpha)
+                        );
+                }
+            }
+
+            vignetteTexture.SetPixels32(
+                pixels
+            );
+
+            vignetteTexture.Apply(
+                false,
+                false
+            );
+
+            if (vignetteMaterial != null)
+            {
+                vignetteMaterial.mainTexture =
+                    vignetteTexture;
+            }
+        }
+
+        // =========================================================
+        // ORGANIC EDGE
+        // =========================================================
+
+        private static float EdgeNoise(
+            float angle
+        )
+        {
+            float n1 =
+                Mathf.Sin(
+                    angle *
+                    EdgeNoiseScale
+                );
+
+            float n2 =
+                Mathf.Sin(
+                    angle *
+                    3.1f +
+                    1.7f
+                ) *
+                0.55f;
+
+            float n3 =
+                Mathf.Sin(
+                    angle *
+                    9.3f +
+                    0.6f
+                ) *
+                0.28f;
+
+            float n4 =
+                Mathf.Sin(
+                    angle *
+                    14.7f +
+                    2.2f
+                ) *
+                0.12f;
+
+            return (
+                n1 +
+                n2 +
+                n3 +
+                n4
+            ) /
+            1.95f;
+        }
+
+        // =========================================================
+        // MATERIAL
+        // =========================================================
+
+        private static void UpdateMaterial()
+        {
+            if (vignetteMaterial == null)
+                return;
+
+            float alpha =
+                Mathf.Clamp01(
+                    currentAlpha *
+                    VignetteIntensity
+                );
+
+            vignetteMaterial.color =
+                new Color(
+                    1f,
+                    1f,
+                    1f,
+                    alpha
+                );
+        }
+
+        private static void HideVignette()
+        {
+            if (vignetteMaterial != null)
+            {
+                vignetteMaterial.color =
+                    new Color(
+                        1f,
+                        1f,
+                        1f,
+                        0f
+                    );
+            }
+
+            if (vignetteRenderer != null)
+            {
+                vignetteRenderer.enabled =
+                    false;
+            }
+        }
+
+        // =========================================================
+        // AUDIO
+        // =========================================================
+
+        private static void RestoreNormalAudio()
+        {
+            try
+            {
+                BoneLib.Audio.SetMuffle(
+                    1f
+                );
+            }
+            catch (Exception ex)
+            {
+                Warn(
+                    "Could not reset audio: " +
+                    ex.Message
+                );
+            }
+
+            StopDeathAudioSources();
+        }
+
+        private static void StopDeathAudioSources()
+        {
+            try
+            {
+                if (Player.Head == null)
+                    return;
+
+                var sources =
+                    Player.Head
+                        .GetComponentsInChildren<AudioSource>(
+                            true
+                        );
+
+                foreach (var source in sources)
+                {
+                    if (source == null)
+                        continue;
+
+                    if (!source.isPlaying)
+                        continue;
+
+                    string objectName = "";
+                    string clipName = "";
+
+                    try
+                    {
+                        objectName =
+                            source.gameObject.name
+                                .ToLowerInvariant();
+                    }
+                    catch
+                    {
+                    }
+
+                    try
+                    {
+                        if (source.clip != null)
+                        {
+                            clipName =
+                                source.clip.name
+                                    .ToLowerInvariant();
+                        }
+                    }
+                    catch
+                    {
+                    }
+
+                    bool deathRelated =
+                        objectName.Contains("heart") ||
+                        objectName.Contains("heartbeat") ||
+                        objectName.Contains("death") ||
+                        objectName.Contains("dying") ||
+                        objectName.Contains("critical") ||
+                        objectName.Contains("neardeath") ||
+                        objectName.Contains("near_death") ||
+
+                        clipName.Contains("heart") ||
+                        clipName.Contains("heartbeat") ||
+                        clipName.Contains("death") ||
+                        clipName.Contains("dying") ||
+                        clipName.Contains("critical") ||
+                        clipName.Contains("neardeath") ||
+                        clipName.Contains("near_death");
+
+                    if (!deathRelated)
+                        continue;
+
+                    source.Stop();
+                }
+            }
+            catch (Exception ex)
+            {
+                Warn(
+                    "Death audio cleanup failed: " +
+                    ex.Message
+                );
+            }
+        }
+
+        private static void AudioSafetyCheck()
+        {
+            if (dying || dead)
+                return;
+
+            if (Time.unscaledTime -
+                lastAudioSafetyReset <
+                AudioResetInterval)
+            {
+                return;
+            }
+
+            lastAudioSafetyReset =
+                Time.unscaledTime;
+
+            try
+            {
+                BoneLib.Audio.SetMuffle(
+                    1f
+                );
+            }
+            catch
+            {
+            }
+        }
+
+        // =========================================================
+        // TEST DAMAGE
+        // =========================================================
+
+        private static void TestDamage(
+            float strength
+        )
+        {
+            if (!Enabled)
+                return;
+
+            EnsureVignette();
+
+            dying = false;
+            dead = false;
+
+            TriggerDamageEffect(
+                strength
+            );
+
+            Log(
+                "Damage vignette test."
+            );
+        }
+
+        // =========================================================
+        // TEST DEATH
+        // =========================================================
+
+        private static void TestDeath()
+        {
+            if (!Enabled)
+                return;
+
+            EnsureVignette();
+
+            dying = true;
+            dead = false;
+
+            deathProgress = 0f;
+            heartbeatTimer = 0f;
+
+            currentAlpha =
+                Mathf.Max(
+                    currentAlpha,
+                    0.30f
+                );
+
+            if (vignetteRenderer != null)
+            {
+                vignetteRenderer.enabled =
+                    true;
+            }
+
+            Log(
+                "Death vignette test."
+            );
+        }
+
+        // =========================================================
+        // RECREATE
+        // =========================================================
+
+        private static void RecreateVignette()
+        {
+            DestroyVignette();
+
+            CreateVignette();
+
+            Log(
+                "Vignette recreated."
+            );
+        }
+
+        // =========================================================
+        // RESET
+        // =========================================================
+
+        private static void ResetRuntimeState()
+        {
+            dying = false;
+            dead = false;
+
+            deathProgress = 0f;
+            heartbeatTimer = 0f;
+
+            damageTimer = 0f;
+            damageStrength = 0f;
+
+            currentAlpha = 0f;
+            targetAlpha = 0f;
+            pulseAlpha = 0f;
+
+            currentDamageRadius =
+                StartingRadius;
+
+            targetDamageRadius =
+                StartingRadius;
+        }
+
+        private static void ResetEffect()
+        {
+            ResetRuntimeState();
+
+            RestoreNormalAudio();
+
+            ForceTextureRefresh();
+
+            HideVignette();
+
+            Log(
+                "Vignette reset."
+            );
+        }
+
+        // =========================================================
+        // FORCE TEXTURE
+        // =========================================================
+
+        private static void ForceTextureRefresh()
+        {
+            currentRadius = -1f;
+
+            currentDamageRadius =
+                StartingRadius;
+
+            targetDamageRadius =
+                StartingRadius;
+
+            if (vignetteTexture != null)
+            {
+                BuildTexture(
+                    StartingRadius
+                );
+            }
+        }
+
+        // =========================================================
+        // DESTROY
+        // =========================================================
+
+        private static void DestroyVignette()
+        {
+            if (vignetteObject != null)
+            {
+                UnityEngine.Object.Destroy(
+                    vignetteObject
+                );
+
+                vignetteObject = null;
+            }
+
+            if (vignetteMaterial != null)
+            {
+                UnityEngine.Object.Destroy(
+                    vignetteMaterial
+                );
+
+                vignetteMaterial = null;
+            }
+
+            if (vignetteTexture != null)
+            {
+                UnityEngine.Object.Destroy(
+                    vignetteTexture
+                );
+
+                vignetteTexture = null;
+            }
+
+            vignetteRenderer = null;
+            headsetCamera = null;
+
+            currentRadius = -1f;
+        }
+
+        // =========================================================
+        // HELPERS
+        // =========================================================
+
+        private static byte FloatToByte(
+            float value
+        )
+        {
+            return (byte)Mathf.Clamp(
+                Mathf.RoundToInt(
+                    value *
+                    255f
+                ),
+                0,
+                255
+            );
+        }
+
+        private static float SmoothStep(
+            float value
+        )
+        {
+            value =
+                Mathf.Clamp01(
+                    value
+                );
+
+            return value *
+                   value *
+                   (
+                       3f -
+                       2f *
+                       value
+                   );
+        }
+
+        private static float SmootherStep(
+            float value
+        )
+        {
+            value =
+                Mathf.Clamp01(
+                    value
+                );
+
+            return value *
+                   value *
+                   value *
+                   (
+                       value *
+                       (
+                           value *
+                           6f -
+                           15f
+                       ) +
+                       10f
+                   );
+        }
+    }
+
+    // =============================================================
+    // QUEST SPIKE SUPPRESSION
+    // =============================================================
+
+    [HarmonyPatch(
+        typeof(Player_Health),
+        "MakeVignette"
+    )]
+    public static class VanillaVignettePatch
+    {
+        public static bool Prefix()
+        {
+            if (!QuestDeathVignetteMod.Enabled)
+                return true;
+
+            if (!QuestDeathVignetteMod.ReplaceVanilla)
+                return true;
+
+            if (QuestDeathVignetteMod.Mode ==
+                VignetteMode.Off)
+            {
+                return true;
+            }
+
+            // Remove the original Quest spike effect.
+            return false;
+        }
+    }
+}
